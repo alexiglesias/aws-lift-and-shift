@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# =============================================================================
+# config.sh.example — copy to config.sh and fill in your values
+# config.sh is gitignored and must never be committed
+# =============================================================================
+
+export AWS_REGION="us-east-1"
+
+# Amazon Linux 2023 AMI — verify current ID for your region:
+# aws ec2 describe-images --owners amazon \
+#   --filters 'Name=name,Values=al2023-ami-*-x86_64' \
+#   --query 'sort_by(Images,&CreationDate)[-1].ImageId'
+export AMI_ID="ami-0c02fb55956c7d316"
+
+export KEY_NAME="selfapp-key"
+
+# Your public IP (curl -s https://checkip.amazonaws.com)
+export YOUR_IP=""
+
+# Optional: custom domain for HTTPS (e.g. selfapp.example.com)
+export DOMAIN_NAME=""
+
+# ACM certificate ARN — fill in after requesting cert in step 06
+export CERT_ARN=""
+
+# S3 bucket name — leave empty to auto-derive as selfapp-artifacts-<account-id>
+export BUCKET_NAME=""
+
+export PRIVATE_ZONE="selfapp.internal"
+
+# Must match values in docker-compose.yml
+export DB_NAME="selfapplite"
+export DB_USER="selfuser"
+export DB_PASS=""
+export DB_ROOT_PASS=""

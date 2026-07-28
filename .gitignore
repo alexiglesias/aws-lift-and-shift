@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# AWS — never commit real config (contains credentials and IPs)
+config.sh
+
+# SSH keys
+*.pem
