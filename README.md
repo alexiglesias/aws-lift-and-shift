@@ -13,13 +13,13 @@
 [![shellcheck](https://img.shields.io/badge/lint-shellcheck-brightgreen)](https://www.shellcheck.net/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-## What's in here
+## What's in here
 
 [selfapp-lite](https://github.com/alexiglesias/docker-buildlab-selfapp) runs locally as a Docker Compose stack (Spring Boot, MySQL, RabbitMQ, Nginx). This project migrates it to AWS with a **Lift & Shift (rehost)** strategy: each service moves to its own EC2 instance, unchanged, behind an Application Load Balancer, then the app tier is made self-healing with an Auto Scaling Group.
 
 Every step is a numbered, re-runnable script. One command validates the whole deployment and another tears it all down.
 
-## Prerequisites
+## Requirements
 
 > **Deploying needs an AWS account and creates billable resources**, roughly $0.10?~@~S0.15 per hour while the stack is up (see [Cost](#cost)). The offline tests (`bash tests/test.sh`) and CI need no AWS account at all.
 
@@ -30,8 +30,8 @@ Every step is a numbered, re-runnable script. One command validates the whole de
 
 ```
 projects/
-?~T~\?~T~@?~T~@ aws-lift-and-shift/        ?~F~P this repo
-?~T~T?~T~@?~T~@ docker-buildlab-selfapp/   ?~F~P git clone https://github.com/alexiglesias/docker-buildlab-selfapp
+    aws-lift-and-shift/        # this repo
+    docker-buildlab-selfapp/   # git clone https://github.com/alexiglesias/docker-buildlab-selfapp
 ```
 
 ## Architecture
@@ -147,16 +147,6 @@ The script then:
 
 Finally, point a CNAME for your domain at the ALB's DNS name.
 
-## Design decisions
-
-**Why the AWS CLI instead of Terraform?** This project is deliberately low-level, to learn what each resource is and how they depend on each other. Every resource the scripts touch, and every ordering problem they solve (IAM propagation delays, lingering ALB network interfaces, ASG-before-instances teardown), is something Terraform would otherwise hide. Rewriting it in Terraform is the natural next project.
-
-**Secrets:** `02-iam.sh` writes passwords to SSM Parameter Store, and instances fetch them at boot through their role. The app reads them from a root-only `EnvironmentFile`. Rendered user data contains no secrets, and the tests fail if it ever does.
-
-**Supply chain:** RabbitMQ and Erlang are installed from pinned GitHub releases and verified against SHA-256 checksums. MySQL comes from Oracle's official repository. The AMI resolves to the latest Amazon Linux 2023 through a public SSM parameter, so it never goes stale.
-
-**Idempotency:** every script checks before it creates. The launch template stores a fingerprint of its config and gets a new version only when something actually changed.
-
 ## Cost
 
 Resources are tagged `Project=selfapp-lift-shift`. The main cost drivers are:
@@ -192,18 +182,6 @@ curl -s localhost:8080/actuator/health       # health, from the app instance its
 | Targets `unhealthy` with code 503 | App is up, but MySQL or RabbitMQ is unreachable: check both userdata logs and `08-validate.sh` DNS checks |
 | Targets `unhealthy`, timeouts | App still booting (allow ~5 min) or crashed: check `journalctl -u selfapp` |
 | `08-validate.sh` reports DNS drift | A backend was replaced and got a new IP: re-run `04-route53.sh` |
-
-## Known limitations and next steps
-
-This is a learning project. In production I would change the following:
-
-- **Private subnets:** the backends would sit in private subnets behind a NAT gateway, with no public IPs, and SSH would be replaced by SSM Session Manager.
-- **Managed services:** Amazon RDS (MySQL) and Amazon MQ (RabbitMQ) would replace the self-managed instances, bringing backups, patching and failover.
-- **HTTPS by default:** HTTPS would be on by default, with the certificate created and DNS-validated by the scripts.
-- **Infrastructure as code:** Terraform or CloudFormation would replace the imperative scripts, adding state, plan/diff and drift detection.
-- **Tighter IAM:** the deploy user would get a least-privilege policy instead of broad administrator access.
-- **Monitoring:** CloudWatch alarms and log shipping would cover the app and both backends.
-- **Build pipeline:** a GitHub Actions workflow would build the JAR and deploy it through OIDC federation, instead of builds from a laptop.
 
 ## Project structure
 
