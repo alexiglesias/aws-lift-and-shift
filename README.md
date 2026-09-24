@@ -226,3 +226,7 @@ aws-lift-and-shift/
     ├── db01.sh
     └── rmq01.sh
 ```
+
+## License
+
+[MIT](./LICENSE)
