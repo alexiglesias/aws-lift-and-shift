@@ -37,23 +37,33 @@ projects/
 ## Architecture
 
 ```mermaid
-flowchart LR
-    user(["Users"]) -->|"HTTP :80 / HTTPS :443"| alb["Application Load Balancer<br/>selfapp-alb"]
+flowchart TB
+    browser(["Browser"])
 
-    subgraph vpc["Default VPC (multi-AZ)"]
-        alb -->|":8080"| app
-        subgraph asg["Auto Scaling Group: 1-3 instances"]
-            app["Spring Boot JAR<br/>Java 17 / systemd"]
-        end
-        app -->|"db01.selfapp.internal:3306"| db[("db01<br/>MySQL 8.4 LTS")]
-        app -->|"rmq01.selfapp.internal:5672"| mq[["rmq01<br/>RabbitMQ 3.13"]]
-        app -.->|"resolves names via"| dns{{"Route 53 private zone<br/>selfapp.internal"}}
+    subgraph aws["AWS, us-east-1"]
+        alb["Load balancer<br/>Checks app health"]
+        app["App server (Spring Boot)<br/>Auto Scaling Group, 1-3"]
+        s3[("S3 bucket<br/>The JAR file")]
+        ssm[("SSM Parameter Store<br/>The passwords")]
+        dns{{"Route 53<br/>Names to private IPs"}}
+        db[("db01: MySQL<br/>Stores the data")]
+        mq[["rmq01: RabbitMQ<br/>Carries events"]]
     end
 
-    s3[("S3<br/>artifact bucket")] -.->|"JAR at boot"| app
-    ssm[("SSM Parameter Store<br/>SecureString secrets")] -.->|"passwords at boot"| app
-    ssm -.-> db
-    ssm -.-> mq
+    browser -->|"HTTP :80"| alb
+    alb -->|":8080"| app
+    s3 -.->|"at boot"| app
+    ssm -.->|"at boot"| app
+    app -.->|"looks up names"| dns
+    app -->|":3306"| db
+    app -->|":5672"| mq
+
+    classDef traffic fill:#EEEDFE,stroke:#534AB7,color:#3C3489
+    classDef backend fill:#E1F5EE,stroke:#0F6E56,color:#085041
+    classDef support fill:#F1EFE8,stroke:#5F5E5A,color:#444441
+    class alb,app traffic
+    class db,mq backend
+    class browser,s3,ssm,dns support
 ```
 
 Security groups are chained so each tier only accepts traffic from the tier in front of it:
