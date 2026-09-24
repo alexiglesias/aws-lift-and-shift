@@ -59,7 +59,9 @@ Internet ──80/443──▶ selfapp-elb-sg ──8080──▶ selfapp-app-sg
 
 ## Prerequisites
 
-- An AWS account and the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), authenticated as an IAM user or role allowed to manage EC2, ELB, Auto Scaling, Route 53, S3, SSM and IAM (the scripts create a role and pass it to instances).
+> **Deploying needs an AWS account and creates billable resources**, roughly $0.10–0.15 per hour while the stack is up (see [Cost](#cost)). The offline tests (`bash tests/test.sh`) and CI need no AWS account at all.
+
+- An AWS account and the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), authenticated as an IAM user or role allowed to manage EC2, ELB, Auto Scaling, Route 53, S3, SSM and IAM (the scripts create a role and pass it to instances). A dedicated deploy user with its own CLI profile (`aws configure --profile selfapp`, then `export AWS_PROFILE=selfapp`) keeps this project separate from your other AWS work.
 - Java 17 and Maven, to build the JAR.
 - Bash: the stock macOS Bash 3.2 works, as does any Linux Bash.
 - The app source, cloned next to this repo:
@@ -172,6 +174,8 @@ Resources are tagged `Project=selfapp-lift-shift`. The main cost drivers are:
 - **Route 53:** $0.50 per hosted zone per month.
 
 AWS accounts created on or after 15 July 2025 get a credit-based Free Plan instead of the old 12-month Free Tier. Check which one applies to your account.
+
+Altogether that's roughly **$0.10–0.15 per hour** in us-east-1, so a 1–2 hour test session costs well under $1. Left running, it's about $80–100 a month.
 
 **Run `99-teardown.sh` when you're not using the stack.** Then confirm nothing is left:
 
