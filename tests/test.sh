@@ -20,7 +20,7 @@ export SELFAPP_CONFIG="$TMP/config.sh"
 
 # A valid config: the example plus test values (later exports win)
 make_config() {
-  cp config.sh.example "$SELFAPP_CONFIG"
+  cp config.sh.example "$SELFAPP_CONFIG" || exit 1
   cat >> "$SELFAPP_CONFIG" <<'CFG'
 export YOUR_IP="203.0.113.10"
 export DB_PASS="TestDbPass1234"
@@ -33,6 +33,12 @@ CFG
 loads_ok() { "$BASH" -c 'source scripts/lib.sh' >/dev/null 2>&1; }
 
 echo "Bash version: $BASH_VERSION"
+
+# Preconditions: without these files every result below would be meaningless
+for REQUIRED in config.sh.example scripts/lib.sh iam/ec2-permissions.json \
+                userdata/app01.sh userdata/db01.sh userdata/rmq01.sh; do
+  [ -f "$REQUIRED" ] || { echo "  ❌ Missing $REQUIRED in $(pwd) — copy it from the repo/zip first."; exit 1; }
+done
 echo "--- Config validation ---"
 
 rm -f "$SELFAPP_CONFIG"
@@ -42,7 +48,13 @@ cp config.sh.example "$SELFAPP_CONFIG"
 if loads_ok; then bad "unfilled example config was accepted"; else ok "unfilled example config is rejected"; fi
 
 make_config
-if loads_ok; then ok "valid config is accepted"; else bad "valid config was rejected"; fi
+if loads_ok; then
+  ok "valid config is accepted"
+else
+  bad "valid config was rejected — stopping, the checks below would be meaningless:"
+  "$BASH" -c 'source scripts/lib.sh' 2>&1 | sed 's/^/       /'
+  exit 1
+fi
 
 check_rejected() {  # $1 = description, $2 = config line to append
   make_config
@@ -64,7 +76,10 @@ render() {  # $1 = template → stdout
 }
 
 for TEMPLATE in userdata/*.sh; do
-  render "$TEMPLATE" > "$TMP/rendered.sh"
+  if ! render "$TEMPLATE" > "$TMP/rendered.sh" || [ ! -s "$TMP/rendered.sh" ]; then
+    bad "$TEMPLATE failed to render"
+    continue
+  fi
   if grep -q '__[A-Z_]*__' "$TMP/rendered.sh"; then
     bad "$TEMPLATE has unrendered placeholders: $(grep -o '__[A-Z_]*__' "$TMP/rendered.sh" | sort -u | tr '\n' ' ')"
   elif ! bash -n "$TMP/rendered.sh"; then
@@ -77,8 +92,9 @@ for TEMPLATE in userdata/*.sh; do
   fi
 done
 
-render iam/ec2-permissions.json > "$TMP/policy.json"
-if python3 -m json.tool "$TMP/policy.json" >/dev/null 2>&1 && ! grep -q '__[A-Z_]*__' "$TMP/policy.json"; then
+if ! render iam/ec2-permissions.json > "$TMP/policy.json" || [ ! -s "$TMP/policy.json" ]; then
+  bad "iam/ec2-permissions.json failed to render"
+elif python3 -m json.tool "$TMP/policy.json" >/dev/null 2>&1 && ! grep -q '__[A-Z_]*__' "$TMP/policy.json"; then
   ok "iam/ec2-permissions.json renders to valid JSON"
 else
   bad "iam/ec2-permissions.json renders to invalid JSON or has placeholders"

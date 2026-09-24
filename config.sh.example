@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# =============================================================================
+# config.sh.example — copy to config.sh and fill in your values:
+#   cp config.sh.example config.sh
+# config.sh is gitignored and must never be committed.
+# Every script validates these values on startup and stops with a clear
+# message if something is missing or malformed.
+# =============================================================================
+
+export AWS_REGION="us-east-1"
+
+# Latest Amazon Linux 2023 AMI, resolved by AWS at launch time via a public
+# SSM parameter — never goes stale and works in every region.
+export AMI_ID="resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+
+# Free Tier eligible type. Accounts on the post-July-2025 Free Plan can also
+# use t3.micro; check the EC2 console "Free tier eligible" filter.
+export INSTANCE_TYPE="t2.micro"
+
+export KEY_NAME="selfapp-key"
+
+# REQUIRED — your public IPv4, used to allow SSH (port 22) from you only:
+#   curl -s https://checkip.amazonaws.com
+export YOUR_IP=""
+
+# Path to the selfapp-lite Maven project (the folder containing pom.xml),
+# relative to this repo. Source: https://github.com/alexiglesias/docker-buildlab-selfapp
+export APP_SRC_DIR="../docker-buildlab-selfapp/app"
+
+# Optional HTTPS: a domain you control and an ISSUED ACM certificate for it
+# in AWS_REGION. Leave both empty to run HTTP-only.
+export DOMAIN_NAME=""
+export CERT_ARN=""
+
+# S3 bucket for the JAR — leave empty to use selfapp-artifacts-<account-id>
+export BUCKET_NAME=""
+
+export PRIVATE_ZONE="selfapp.internal"
+
+# Tag applied to every resource; teardown uses it to find what to delete.
+export PROJECT_TAG="selfapp-lift-shift"
+
+# Secrets are stored in SSM Parameter Store (SecureString) under this prefix
+# by 02-iam.sh. Instances read them at boot — they are never baked into
+# user data or committed anywhere.
+export SSM_PREFIX="/selfapp"
+
+# Same names as docker-buildlab-selfapp's .env.
+# Passwords: 12+ chars from [A-Za-z0-9._@%+=:,-]. Generate one with:
+#   openssl rand -base64 24 | tr -d '/+='
+export DB_NAME="selfapplite"
+export DB_USER="selfuser"
+export DB_PASS=""
+export DB_ROOT_PASS=""
+
+export RMQ_USER="selfmq"
+export RMQ_PASS=""
