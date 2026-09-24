@@ -1,12 +1,38 @@
-# AWS Lift & Shift: selfapp-lite on EC2
+# aws lift-and-shift
+
+> Rehosting a containerised Spring Boot app onto AWS EC2 using nothing but the AWS CLI and Bash.
 
 [![CI](https://github.com/alexiglesias/aws-lift-and-shift/actions/workflows/ci.yml/badge.svg)](https://github.com/alexiglesias/aws-lift-and-shift/actions/workflows/ci.yml)
+[![aws cli](https://img.shields.io/badge/aws%20cli-v2-FF9900)](https://aws.amazon.com/cli/)
+[![aws services](https://img.shields.io/badge/aws%20services-7-FF9900)](#architecture)
+[![bash](https://img.shields.io/badge/bash-3.2%2B-4EAA25)](https://www.gnu.org/software/bash/)
+[![amazon linux](https://img.shields.io/badge/amazon%20linux-2023-orange)](https://aws.amazon.com/linux/amazon-linux-2023/)
+[![java](https://img.shields.io/badge/java-17-orange)](https://aws.amazon.com/corretto/)
+[![mysql](https://img.shields.io/badge/mysql-8.4%20LTS-blue)](https://www.mysql.com/)
+[![rabbitmq](https://img.shields.io/badge/rabbitmq-3.13-orange)](https://www.rabbitmq.com/)
+[![shellcheck](https://img.shields.io/badge/lint-shellcheck-brightgreen)](https://www.shellcheck.net/)
+[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-Rehosting a containerised Spring Boot app onto AWS EC2 using nothing but the AWS CLI and Bash.
+## What's in here
 
 [selfapp-lite](https://github.com/alexiglesias/docker-buildlab-selfapp) runs locally as a Docker Compose stack (Spring Boot, MySQL, RabbitMQ, Nginx). This project migrates it to AWS with a **Lift & Shift (rehost)** strategy: each service moves to its own EC2 instance, unchanged, behind an Application Load Balancer, then the app tier is made self-healing with an Auto Scaling Group.
 
 Every step is a numbered, re-runnable script. One command validates the whole deployment and another tears it all down.
+
+## Prerequisites
+
+> **Deploying needs an AWS account and creates billable resources**, roughly $0.10?~@~S0.15 per hour while the stack is up (see [Cost](#cost)). The offline tests (`bash tests/test.sh`) and CI need no AWS account at all.
+
+- An AWS account and the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), authenticated as an IAM user or role allowed to manage EC2, ELB, Auto Scaling, Route 53, S3, SSM and IAM (the scripts create a role and pass it to instances). A dedicated deploy user with its own CLI profile (`aws configure --profile selfapp`, then `export AWS_PROFILE=selfapp`) keeps this project separate from your other AWS work.
+- Java 17 and Maven, to build the JAR.
+- Bash: the stock macOS Bash 3.2 works, as does any Linux Bash.
+- The app source, cloned next to this repo:
+
+```
+projects/
+?~T~\?~T~@?~T~@ aws-lift-and-shift/        ?~F~P this repo
+?~T~T?~T~@?~T~@ docker-buildlab-selfapp/   ?~F~P git clone https://github.com/alexiglesias/docker-buildlab-selfapp
+```
 
 ## Architecture
 
@@ -35,41 +61,6 @@ Security groups are chained so each tier only accepts traffic from the tier in f
 ```
 Internet ──80/443──▶ selfapp-elb-sg ──8080──▶ selfapp-app-sg ──3306/5672──▶ selfapp-backend-sg
                                     SSH (22) only from YOUR_IP ──▶ app + backend
-```
-
-### From Docker Compose to AWS
-
-| Compose service | AWS equivalent | Notes |
-|---|---|---|
-| `selfweb` (Nginx) | Application Load Balancer | Managed, multi-AZ, health checks, TLS termination |
-| `selfapp` | EC2 in an Auto Scaling Group | JAR from S3, run by systemd as an unprivileged user |
-| `selfdb` (`mysql:8.0`) | `db01` EC2, MySQL 8.4 LTS | 8.0 reached end of life in April 2026 |
-| `selfmq` (`rabbitmq:3.13`) | `rmq01` EC2, RabbitMQ 3.13.7 | Pinned RPMs verified by SHA-256 |
-| Compose network + service names | Route 53 private hosted zone | `db01.selfapp.internal` replaces `selfdb` |
-| `.env` file | SSM Parameter Store | Encrypted, read at boot through an IAM role |
-
-## What this project demonstrates
-
-- **Infrastructure automation with the AWS CLI:** EC2, ALB, Auto Scaling, Route 53, S3, IAM and SSM, all scripted and idempotent (safe to re-run).
-- **Least-privilege IAM:** instances use a role that can only read one bucket and one parameter path. There are no access keys on any server.
-- **Secrets management:** passwords never appear in user data, unit files or Git.
-- **Zero-downtime deployments:** a new build rolls out through an ASG instance refresh (launch before terminate).
-- **Testing and CI:** ShellCheck plus offline tests on Linux *and* macOS's stock Bash 3.2, on every push.
-- **Cost awareness:** everything is tagged, and a dependency-ordered teardown removes every billable resource.
-
-## Prerequisites
-
-> **Deploying needs an AWS account and creates billable resources**, roughly $0.10–0.15 per hour while the stack is up (see [Cost](#cost)). The offline tests (`bash tests/test.sh`) and CI need no AWS account at all.
-
-- An AWS account and the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), authenticated as an IAM user or role allowed to manage EC2, ELB, Auto Scaling, Route 53, S3, SSM and IAM (the scripts create a role and pass it to instances). A dedicated deploy user with its own CLI profile (`aws configure --profile selfapp`, then `export AWS_PROFILE=selfapp`) keeps this project separate from your other AWS work.
-- Java 17 and Maven, to build the JAR.
-- Bash: the stock macOS Bash 3.2 works, as does any Linux Bash.
-- The app source, cloned next to this repo:
-
-```
-projects/
-├── aws-lift-and-shift/        ← this repo
-└── docker-buildlab-selfapp/   ← git clone https://github.com/alexiglesias/docker-buildlab-selfapp
 ```
 
 ## Quick start
