@@ -1,74 +1,69 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 04-route53.sh
-# Creates the Route 53 private hosted zone (selfapp.internal) and registers
-# A records for db01, mc01, rmq01 using their current private IPs.
+# Creates a Route 53 PRIVATE hosted zone (PRIVATE_ZONE, e.g. selfapp.internal)
+# attached to the default VPC, and points db01 / rmq01 at their private IPs.
+# The app then connects to db01.selfapp.internal instead of a hard-coded IP —
+# the same idea as service names in docker-compose.
+# Safe to re-run: records are UPSERTed, so new IPs simply replace old ones.
+# Cost: $0.50/month per hosted zone (not Free Tier).
 # =============================================================================
 set -euo pipefail
-source "$(dirname "$0")/../config.sh"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "$0")/lib.sh"
 
-echo "==> [04] Setting up Route 53 Private Hosted Zone: $PRIVATE_ZONE"
+step "[04] Route 53 private hosted zone: $PRIVATE_ZONE"
 
-VPC_ID=$(aws ec2 describe-vpcs \
-  --filters Name=isDefault,Values=true \
-  --region "$AWS_REGION" \
-  --query 'Vpcs[0].VpcId' --output text)
+VPC_ID=$(get_vpc_id)
+[ -n "$VPC_ID" ] || die "No default VPC found"
 
-# ---------- Create hosted zone if it doesn't exist ----------
-ZONE_ID=$(aws route53 list-hosted-zones-by-name \
-  --dns-name "$PRIVATE_ZONE" \
-  --query "HostedZones[?Name=='${PRIVATE_ZONE}.'].Id" \
-  --output text | cut -d/ -f3)
+# Private zones only resolve if the VPC has DNS support + hostnames enabled
+# (true for the default VPC, but checking makes failures obvious).
+for ATTR in enableDnsSupport:EnableDnsSupport enableDnsHostnames:EnableDnsHostnames; do
+  NAME=${ATTR%%:*} FIELD=${ATTR##*:}
+  VALUE=$(aws ec2 describe-vpc-attribute --vpc-id "$VPC_ID" --attribute "$NAME" \
+    --query "${FIELD}.Value" --output text)
+  [ "$VALUE" = "True" ] || die "VPC $VPC_ID has $NAME disabled. Enable it: aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --$NAME '{\"Value\":true}'"
+done
+
+# ---------- Hosted zone (match private zones only, never a public one) ----------
+ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$PRIVATE_ZONE" \
+  --query "HostedZones[?Name=='${PRIVATE_ZONE}.' && Config.PrivateZone] | [0].Id" \
+  --output text | none_to_empty)
+ZONE_ID=${ZONE_ID##*/}   # "/hostedzone/Z123" → "Z123"
 
 if [ -z "$ZONE_ID" ]; then
-  echo "  Creating private hosted zone: $PRIVATE_ZONE"
+  log "Creating private hosted zone: $PRIVATE_ZONE"
   ZONE_ID=$(aws route53 create-hosted-zone \
     --name "$PRIVATE_ZONE" \
     --caller-reference "selfapp-$(date +%s)" \
     --hosted-zone-config Comment="selfapp internal DNS",PrivateZone=true \
     --vpc VPCRegion="$AWS_REGION",VPCId="$VPC_ID" \
-    --query 'HostedZone.Id' --output text | cut -d/ -f3)
-  echo "  Zone created: $ZONE_ID"
+    --query 'HostedZone.Id' --output text)
+  ZONE_ID=${ZONE_ID##*/}
+  aws route53 change-tags-for-resource --resource-type hostedzone \
+    --resource-id "$ZONE_ID" --add-tags "Key=Project,Value=$PROJECT_TAG"
 else
-  echo "  Zone already exists: $ZONE_ID"
+  log "Zone already exists: $ZONE_ID"
 fi
 
-# ---------- Upsert A records ----------
-upsert_record() {
-  local HOSTNAME=$1
-  local IP
-  IP=$(aws ec2 describe-instances \
-    --filters "Name=tag:Name,Values=${HOSTNAME}" Name=instance-state-name,Values=running \
-    --region "$AWS_REGION" \
-    --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+# ---------- A records: one batch, then wait until live ----------
+CHANGES=""
+for HOST in db01 rmq01; do
+  IP=$(get_private_ip "$HOST")
+  [ -n "$IP" ] || die "$HOST is not running — run 03-backends.sh first"
+  log "${HOST}.${PRIVATE_ZONE} → $IP"
+  CHANGES+="${CHANGES:+,}{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"${HOST}.${PRIVATE_ZONE}\",\"Type\":\"A\",\"TTL\":60,\"ResourceRecords\":[{\"Value\":\"${IP}\"}]}}"
+done
 
-  if [ -z "$IP" ] || [ "$IP" = "None" ]; then
-    echo "  WARNING: $HOSTNAME not found or not running — skipping DNS record"
-    return
-  fi
+CHANGE_ID=$(aws route53 change-resource-record-sets \
+  --hosted-zone-id "$ZONE_ID" \
+  --change-batch "{\"Comment\":\"selfapp backends\",\"Changes\":[${CHANGES}]}" \
+  --query 'ChangeInfo.Id' --output text)
 
-  echo "  ${HOSTNAME}.${PRIVATE_ZONE} → $IP"
-  aws route53 change-resource-record-sets \
-    --hosted-zone-id "$ZONE_ID" \
-    --change-batch "{
-      \"Changes\": [{
-        \"Action\": \"UPSERT\",
-        \"ResourceRecordSet\": {
-          \"Name\": \"${HOSTNAME}.${PRIVATE_ZONE}\",
-          \"Type\": \"A\",
-          \"TTL\": 300,
-          \"ResourceRecords\": [{\"Value\": \"${IP}\"}]
-        }
-      }]
-    }" > /dev/null
-}
-
-upsert_record "db01"
-upsert_record "mc01"
-upsert_record "rmq01"
+log "Waiting for DNS change to propagate..."
+aws route53 wait resource-record-sets-changed --id "$CHANGE_ID"
 
 echo ""
-echo "==> Done. DNS records registered in $PRIVATE_ZONE"
-echo "    app01 will resolve db01.${PRIVATE_ZONE} to reach MySQL."
-echo ""
-echo "    Run 05-deploy-app.sh next."
+step "Done. app01 will reach db01.${PRIVATE_ZONE} and rmq01.${PRIVATE_ZONE}"
+log "Next: 05-deploy-app.sh"

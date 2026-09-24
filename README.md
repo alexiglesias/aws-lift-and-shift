@@ -1,154 +1,231 @@
-# Project 06 — AWS Lift & Shift: selfapp-lite on EC2
+# AWS Lift & Shift: selfapp-lite on EC2
 
-Migrate **selfapp-lite** (Spring Boot + MySQL) from local Docker Compose to AWS using a Lift & Shift (Rehost) strategy. Each service runs on its own EC2 t2.micro instance within the AWS Free Tier.
+[![CI](https://github.com/alexiglesias/aws-lift-and-shift/actions/workflows/ci.yml/badge.svg)](https://github.com/alexiglesias/aws-lift-and-shift/actions/workflows/ci.yml)
+
+Rehosting a containerised Spring Boot app onto AWS EC2 using nothing but the AWS CLI and Bash.
+
+[selfapp-lite](https://github.com/alexiglesias/docker-buildlab-selfapp) runs locally as a Docker Compose stack (Spring Boot, MySQL, RabbitMQ, Nginx). This project migrates it to AWS with a **Lift & Shift (rehost)** strategy: each service moves to its own EC2 instance, unchanged, behind an Application Load Balancer, then the app tier is made self-healing with an Auto Scaling Group.
+
+Every step is a numbered, re-runnable script. One command validates the whole deployment and another tears it all down.
 
 ## Architecture
 
-```
-                    ┌─────────────────────────────────┐
-                    │           AWS Cloud              │
-                    │                                  │
-  Internet ──HTTPS──► [selfapp-alb]                   │
-                    │       │                          │
-                    │       │ :8080                    │
-                    │       ▼                          │
-                    │  [app01 / ASG]                   │
-                    │  Spring Boot JAR                 │
-                    │  selfapp-app-sg                  │
-                    │       │                          │
-                    │  selfapp.internal (Route 53)     │
-                    │  ┌────┴──────────────────┐       │
-                    │  ▼          ▼            ▼       │
-                    │ [db01]   [mc01]      [rmq01]     │
-                    │ MySQL    Memcached   RabbitMQ     │
-                    │ :3306    :11211      :5672        │
-                    │ selfapp-backend-sg               │
-                    └─────────────────────────────────┘
+```mermaid
+flowchart LR
+    user(["Users"]) -->|"HTTP :80 / HTTPS :443"| alb["Application Load Balancer<br/>selfapp-alb"]
+
+    subgraph vpc["Default VPC (multi-AZ)"]
+        alb -->|":8080"| app
+        subgraph asg["Auto Scaling Group: 1-3 instances"]
+            app["Spring Boot JAR<br/>Java 17 / systemd"]
+        end
+        app -->|"db01.selfapp.internal:3306"| db[("db01<br/>MySQL 8.4 LTS")]
+        app -->|"rmq01.selfapp.internal:5672"| mq[["rmq01<br/>RabbitMQ 3.13"]]
+        app -.->|"resolves names via"| dns{{"Route 53 private zone<br/>selfapp.internal"}}
+    end
+
+    s3[("S3<br/>artifact bucket")] -.->|"JAR at boot"| app
+    ssm[("SSM Parameter Store<br/>SecureString secrets")] -.->|"passwords at boot"| app
+    ssm -.-> db
+    ssm -.-> mq
 ```
 
-> Nginx is dropped — the ALB forwards directly to Spring Boot on port 8080.  
-> Memcached and RabbitMQ are provisioned but not yet wired to the app (stretch exercise).
+Security groups are chained so each tier only accepts traffic from the tier in front of it:
 
-## Stack
+```
+Internet ──80/443──▶ selfapp-elb-sg ──8080──▶ selfapp-app-sg ──3306/5672──▶ selfapp-backend-sg
+                                    SSH (22) only from YOUR_IP ──▶ app + backend
+```
 
-| EC2 instance | Service | Port |
+### From Docker Compose to AWS
+
+| Compose service | AWS equivalent | Notes |
 |---|---|---|
-| db01 | MySQL 8.0 | 3306 |
-| mc01 | Memcached 1.6 | 11211 |
-| rmq01 | RabbitMQ 3.13 | 5672 / 15672 |
-| app01 / ASG | Spring Boot JAR | 8080 |
-| ALB | HTTP/HTTPS entrypoint | 80 / 443 |
+| `selfweb` (Nginx) | Application Load Balancer | Managed, multi-AZ, health checks, TLS termination |
+| `selfapp` | EC2 in an Auto Scaling Group | JAR from S3, run by systemd as an unprivileged user |
+| `selfdb` (`mysql:8.0`) | `db01` EC2, MySQL 8.4 LTS | 8.0 reached end of life in April 2026 |
+| `selfmq` (`rabbitmq:3.13`) | `rmq01` EC2, RabbitMQ 3.13.7 | Pinned RPMs verified by SHA-256 |
+| Compose network + service names | Route 53 private hosted zone | `db01.selfapp.internal` replaces `selfdb` |
+| `.env` file | SSM Parameter Store | Encrypted, read at boot through an IAM role |
+
+## What this project demonstrates
+
+- **Infrastructure automation with the AWS CLI:** EC2, ALB, Auto Scaling, Route 53, S3, IAM and SSM, all scripted and idempotent (safe to re-run).
+- **Least-privilege IAM:** instances use a role that can only read one bucket and one parameter path. There are no access keys on any server.
+- **Secrets management:** passwords never appear in user data, unit files or Git.
+- **Zero-downtime deployments:** a new build rolls out through an ASG instance refresh (launch before terminate).
+- **Testing and CI:** ShellCheck plus offline tests on Linux *and* macOS's stock Bash 3.2, on every push.
+- **Cost awareness:** everything is tagged, and a dependency-ordered teardown removes every billable resource.
 
 ## Prerequisites
 
-- AWS CLI configured (`aws configure`)
-- Java 17 + Maven installed locally
-- AWS account with Free Tier active
-- The selfapp-lite source at `../docker-buildlab-selfapp/`
+- An AWS account and the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), authenticated as an IAM user or role allowed to manage EC2, ELB, Auto Scaling, Route 53, S3, SSM and IAM (the scripts create a role and pass it to instances).
+- Java 17 and Maven, to build the JAR.
+- Bash: the stock macOS Bash 3.2 works, as does any Linux Bash.
+- The app source, cloned next to this repo:
 
-## Setup
+```
+projects/
+├── aws-lift-and-shift/        ← this repo
+└── docker-buildlab-selfapp/   ← git clone https://github.com/alexiglesias/docker-buildlab-selfapp
+```
 
-### 1. Configure
+## Quick start
+
+**1. Configure.** Every script validates the config on startup and stops with a clear message if something is missing.
 
 ```bash
 cp config.sh.example config.sh
-# Edit config.sh — fill in YOUR_IP at minimum
+# Set YOUR_IP, DB_PASS, DB_ROOT_PASS and RMQ_PASS. Generate passwords with:
+openssl rand -base64 24 | tr -d '/+='
 ```
 
-### 2. Deploy — run scripts in order
+**2. Deploy.** This takes about 20–30 minutes; most of it is instances installing packages.
 
 ```bash
-bash scripts/01-security-groups.sh   # Key pair + 3 Security Groups
-bash scripts/02-iam.sh               # IAM Role + Instance Profile (S3 access)
-bash scripts/03-backends.sh          # Launch db01, mc01, rmq01
-bash scripts/04-route53.sh           # Private DNS: selfapp.internal
-bash scripts/05-deploy-app.sh        # Build JAR → S3 → launch app01
-bash scripts/06-alb.sh               # Target Group + ALB + Listeners
-bash scripts/07-asg.sh               # Launch Template + Auto Scaling Group
-bash scripts/08-validate.sh          # End-to-end health check
+bash scripts/01-security-groups.sh   # key pair + 3 chained security groups
+bash scripts/02-iam.sh               # secrets → SSM, least-privilege role + instance profile
+bash scripts/03-backends.sh          # db01 (MySQL) + rmq01 (RabbitMQ)
+bash scripts/04-route53.sh           # private DNS: db01/rmq01.selfapp.internal
+bash scripts/05-deploy-app.sh        # build JAR → S3 → launch app01
+bash scripts/06-alb.sh               # target group + ALB + listeners
+bash scripts/08-validate.sh --wait   # rehost done: app01 serving behind the ALB
 ```
 
-All scripts are **idempotent** — safe to re-run if a step fails.
+**3. Make it self-healing.** Move the app tier from one server to an Auto Scaling Group.
 
-### 3. Validate
-
-`08-validate.sh` prints a ✅/❌ checklist covering EC2 state, ALB health, DNS, and the `/actuator/health` endpoint. A passing run looks like:
-
-```
-✅ db01 is running
-✅ mc01 is running
-✅ rmq01 is running
-✅ app01 is running
-✅ selfapp-alb exists: selfapp-alb-xxx.us-east-1.elb.amazonaws.com
-✅ Target group: 1 healthy target(s)
-✅ /actuator/health → HTTP 200
-✅ /login → HTTP 200
-✅ Hosted zone selfapp.internal exists (3 A records)
-✅ selfapp-asg desired capacity: 1
+```bash
+bash scripts/07-asg.sh               # launch template + ASG (min 1, max 3, CPU 70% target)
+bash scripts/08-validate.sh --wait
+# then retire app01 with the command 07-asg.sh prints
 ```
 
-## Project Structure
+**4. Tear down.** Do this when you're done, to stop all charges.
+
+```bash
+bash scripts/99-teardown.sh
+```
+
+<!--
+Screenshots go here after a live run, e.g.:
+![Validation output](docs/validate.png)
+![Healthy targets](docs/target-group.png)
+-->
+
+## The scripts
+
+| Script | What it does |
+|---|---|
+| `lib.sh` | Shared helpers sourced by every script: loads and validates config, defines resource names in one place, and wraps AWS lookups |
+| `01-security-groups.sh` | Key pair and three security groups (ALB → app → backends) |
+| `02-iam.sh` | Stores secrets as SSM SecureStrings; creates a role scoped to one bucket and one parameter path |
+| `03-backends.sh` | Launches db01 and rmq01 with IMDSv2, the instance profile and tags |
+| `04-route53.sh` | Private hosted zone and A records, waiting until DNS is live |
+| `05-deploy-app.sh` | Builds the JAR, uploads it to a private S3 bucket, launches app01 |
+| `06-alb.sh` | Target group (`/actuator/health`), multi-AZ ALB, listeners reconciled to config |
+| `07-asg.sh` | Versioned launch template and ASG with target tracking; rolls out changes with an instance refresh |
+| `08-validate.sh` | End-to-end checks with a CI-friendly exit code (details below) |
+| `99-teardown.sh` | Deletes everything in dependency order; safe to re-run |
+
+`08-validate.sh` checks that:
+- every instance is running
+- the DNS records match the current instance IPs
+- no app or backend port is open to the internet
+- the target group has at least one healthy target
+- the app reports `UP` through the ALB, which proves it can reach both MySQL and RabbitMQ
+
+### Deploying a new version
+
+```bash
+bash scripts/05-deploy-app.sh        # build + upload the new JAR
+bash scripts/07-asg.sh --refresh     # replace instances one by one, no downtime
+```
+
+### Optional: HTTPS
+
+Request an ACM certificate for a domain you control, validate it, then set `DOMAIN_NAME` and `CERT_ARN` in `config.sh` and re-run `06-alb.sh`.
+
+The script then:
+- adds a TLS 1.2/1.3-only HTTPS listener
+- turns port 80 into a permanent redirect
+- removes the HTTPS listener again if you clear `CERT_ARN`
+
+Finally, point a CNAME for your domain at the ALB's DNS name.
+
+## Design decisions
+
+**Why the AWS CLI instead of Terraform?** This project is deliberately low-level, to learn what each resource is and how they depend on each other. Every resource the scripts touch, and every ordering problem they solve (IAM propagation delays, lingering ALB network interfaces, ASG-before-instances teardown), is something Terraform would otherwise hide. Rewriting it in Terraform is the natural next project.
+
+**Secrets:** `02-iam.sh` writes passwords to SSM Parameter Store, and instances fetch them at boot through their role. The app reads them from a root-only `EnvironmentFile`. Rendered user data contains no secrets, and the tests fail if it ever does.
+
+**Supply chain:** RabbitMQ and Erlang are installed from pinned GitHub releases and verified against SHA-256 checksums. MySQL comes from Oracle's official repository. The AMI resolves to the latest Amazon Linux 2023 through a public SSM parameter, so it never goes stale.
+
+**Idempotency:** every script checks before it creates. The launch template stores a fingerprint of its config and gets a new version only when something actually changed.
+
+## Cost
+
+Resources are tagged `Project=selfapp-lift-shift`. The main cost drivers are:
+
+- **EC2:** 3 × t2.micro running 24/7 is about 2,200 instance-hours a month, roughly three times the legacy Free Tier's 750 hours.
+- **Application Load Balancer:** billed per hour, plus usage.
+- **Public IPv4 addresses:** each instance's public IP is billed hourly.
+- **Route 53:** $0.50 per hosted zone per month.
+
+AWS accounts created on or after 15 July 2025 get a credit-based Free Plan instead of the old 12-month Free Tier. Check which one applies to your account.
+
+**Run `99-teardown.sh` when you're not using the stack.** Then confirm nothing is left:
+
+```bash
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=selfapp-lift-shift
+```
+
+## Troubleshooting
+
+```bash
+ssh -i ~/.ssh/selfapp-key.pem ec2-user@<public-ip>
+
+sudo tail -n 50 /var/log/userdata-db01.log   # bootstrap log; failures print "FAILED at line N"
+sudo journalctl -u selfapp -f                # app logs (app instances)
+curl -s localhost:8080/actuator/health       # health, from the app instance itself
+```
+
+| Symptom | Likely cause |
+|---|---|
+| `UnauthorizedOperation` from the CLI | The CLI user lacks permissions for that service; check `aws sts get-caller-identity` |
+| Targets `unhealthy` with code 503 | App is up, but MySQL or RabbitMQ is unreachable: check both userdata logs and `08-validate.sh` DNS checks |
+| Targets `unhealthy`, timeouts | App still booting (allow ~5 min) or crashed: check `journalctl -u selfapp` |
+| `08-validate.sh` reports DNS drift | A backend was replaced and got a new IP: re-run `04-route53.sh` |
+
+## Known limitations and next steps
+
+This is a learning project. In production I would change the following:
+
+- **Private subnets:** the backends would sit in private subnets behind a NAT gateway, with no public IPs, and SSH would be replaced by SSM Session Manager.
+- **Managed services:** Amazon RDS (MySQL) and Amazon MQ (RabbitMQ) would replace the self-managed instances, bringing backups, patching and failover.
+- **HTTPS by default:** HTTPS would be on by default, with the certificate created and DNS-validated by the scripts.
+- **Infrastructure as code:** Terraform or CloudFormation would replace the imperative scripts, adding state, plan/diff and drift detection.
+- **Tighter IAM:** the deploy user would get a least-privilege policy instead of broad administrator access.
+- **Monitoring:** CloudWatch alarms and log shipping would cover the app and both backends.
+- **Build pipeline:** a GitHub Actions workflow would build the JAR and deploy it through OIDC federation, instead of builds from a laptop.
+
+## Project structure
 
 ```
 aws-lift-and-shift/
-├── config.sh             # Your settings (gitignored)
-├── config.sh.example     # Template — commit this, not config.sh
+├── .github/workflows/ci.yml   # ShellCheck + tests (Linux and macOS)
+├── .shellcheckrc              # shared lint settings
+├── config.sh.example          # copy to config.sh (gitignored)
 ├── iam/
-│   └── ec2-trust.json    # IAM trust policy for EC2 → S3
-├── userdata/             # EC2 bootstrap scripts
-│   ├── db01.sh
-│   ├── mc01.sh
-│   ├── rmq01.sh
-│   └── app01.sh
-└── scripts/              # Numbered deploy scripts
-    ├── 01-security-groups.sh
-    ├── 02-iam.sh
-    ├── 03-backends.sh
-    ├── 04-route53.sh
-    ├── 05-deploy-app.sh
-    ├── 06-alb.sh
-    ├── 07-asg.sh
-    └── 08-validate.sh
-```
-
-## Cost (AWS Free Tier)
-
-| Resource | Free Tier allowance |
-|---|---|
-| EC2 t2.micro × 4 | 750 h/month shared |
-| ALB | 750 h/month |
-| S3 | 5 GB / 20k GET / 2k PUT |
-| ACM (SSL) | Always free |
-| Route 53 | $0.50/hosted zone/month — not free |
-
-**Always terminate resources when not actively working on the project** to stay within the 750h limit. Run this to stop all charges:
-
-```bash
-# Terminate all EC2s tagged with this project
-aws ec2 terminate-instances --region us-east-1 \
-  --instance-ids $(aws ec2 describe-instances \
-    --filters "Name=tag:Project,Values=selfapp-lift-shift" \
-              "Name=instance-state-name,Values=running" \
-    --query 'Reservations[*].Instances[*].InstanceId' \
-    --output text)
-
-# Delete the ALB and ASG
-aws elbv2 delete-load-balancer --load-balancer-arn <ALB_ARN>
-aws autoscaling delete-auto-scaling-group --auto-scaling-group-name selfapp-asg --force-delete
-```
-
-## Debugging
-
-```bash
-# SSH into any instance
-ssh -i ~/.ssh/selfapp-key.pem ec2-user@<PUBLIC_IP>
-
-# Check app01 Spring Boot logs
-sudo journalctl -u selfapp -f
-
-# Check userdata execution log
-sudo cat /var/log/userdata-app01.log
-
-# Test DB connectivity from app01
-mysql -h db01.selfapp.internal -u selfuser -pselfpass selfapplite
+│   ├── ec2-trust.json         # lets EC2 assume the instance role
+│   └── ec2-permissions.json   # least-privilege S3 + SSM policy (template)
+├── scripts/
+│   ├── lib.sh                 # shared helpers and config validation
+│   ├── 01-security-groups.sh … 08-validate.sh
+│   └── 99-teardown.sh
+├── tests/
+│   └── test.sh                # offline tests, no AWS needed
+└── userdata/                  # EC2 bootstrap templates
+    ├── app01.sh
+    ├── db01.sh
+    └── rmq01.sh
 ```

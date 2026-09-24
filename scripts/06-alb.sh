@@ -1,121 +1,130 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 06-alb.sh
-# Creates: Target Group → registers app01 → ALB → Listeners (HTTP + HTTPS)
-#
-# If CERT_ARN is set in config.sh: HTTP redirects to HTTPS, HTTPS forwards.
-# If CERT_ARN is empty:            HTTP forwards directly (no SSL, for testing).
+# Creates the Application Load Balancer in front of the app tier:
+#   Target group (HTTP :8080, health check /actuator/health)
+#   → registers app01 (if it exists)
+#   → internet-facing ALB across every default subnet (multi-AZ)
+#   → listeners, reconciled to match config.sh on every run:
+#       CERT_ARN set:   :443 HTTPS → app,  :80 → 301 redirect to HTTPS
+#       CERT_ARN empty: :80  HTTP  → app  (and any :443 listener is removed)
 # =============================================================================
 set -euo pipefail
-source "$(dirname "$0")/../config.sh"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "$0")/lib.sh"
 
-echo "==> [06] Creating ALB, Target Group, Listeners"
+SSL_POLICY="ELBSecurityPolicy-TLS13-1-2-2021-06"   # TLS 1.2 + 1.3 only
 
-VPC_ID=$(aws ec2 describe-vpcs \
-  --filters Name=isDefault,Values=true \
-  --region "$AWS_REGION" \
-  --query 'Vpcs[0].VpcId' --output text)
+step "[06] Target group, ALB and listeners"
 
-ELB_SG=$(aws ec2 describe-security-groups \
-  --filters Name=group-name,Values=selfapp-ELB-sg Name=vpc-id,Values="$VPC_ID" \
-  --region "$AWS_REGION" \
-  --query 'SecurityGroups[0].GroupId' --output text)
+VPC_ID=$(get_vpc_id)
+ELB_SG=$(get_sg_id "$ELB_SG_NAME")
+[ -n "$ELB_SG" ] || die "Security group '$ELB_SG_NAME' not found — run 01-security-groups.sh first"
 
-# ---------- Target Group ----------
-TG_ARN=$(aws elbv2 describe-target-groups \
-  --names selfapp-tg \
-  --region "$AWS_REGION" \
-  --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "None")
+if [ -n "$CERT_ARN" ]; then
+  CERT_STATUS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" \
+    --query 'Certificate.Status' --output text 2>/dev/null || echo "NOT_FOUND")
+  [ "$CERT_STATUS" = "ISSUED" ] || die "Certificate $CERT_ARN is $CERT_STATUS (needs ISSUED, in $AWS_REGION)"
+fi
 
-if [ "$TG_ARN" = "None" ] || [ -z "$TG_ARN" ]; then
-  echo "  Creating target group: selfapp-tg (port 8080)"
+# ---------- Target group ----------
+TG_ARN=$(get_tg_arn)
+if [ -z "$TG_ARN" ]; then
+  log "Creating target group: $TG_NAME"
   TG_ARN=$(aws elbv2 create-target-group \
-    --name selfapp-tg \
-    --protocol HTTP \
-    --port 8080 \
+    --name "$TG_NAME" \
+    --protocol HTTP --port 8080 \
     --vpc-id "$VPC_ID" \
+    --target-type instance \
     --health-check-path /actuator/health \
-    --health-check-interval-seconds 30 \
+    --health-check-interval-seconds 15 \
     --healthy-threshold-count 2 \
     --unhealthy-threshold-count 3 \
-    --region "$AWS_REGION" \
+    --matcher HttpCode=200 \
+    --tags "Key=Project,Value=$PROJECT_TAG" \
     --query 'TargetGroups[0].TargetGroupArn' --output text)
 else
-  echo "  Target group already exists: $TG_ARN"
+  log "Target group exists: $TG_NAME"
+fi
+# Default deregistration delay is 300s; 30s makes ASG rollouts much faster
+aws elbv2 modify-target-group-attributes --target-group-arn "$TG_ARN" \
+  --attributes Key=deregistration_delay.timeout_seconds,Value=30 > /dev/null
+
+APP01_ID=$(get_instance_id app01)
+if [ -n "$APP01_ID" ]; then
+  log "Registering app01 ($APP01_ID)"
+  aws elbv2 register-targets --target-group-arn "$TG_ARN" --targets "Id=$APP01_ID,Port=8080"
+else
+  log "No app01 instance — skipping registration (the ASG registers its own instances)"
 fi
 
-# ---------- Register app01 ----------
-APP01_ID=$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=app01" Name=instance-state-name,Values=running \
-  --region "$AWS_REGION" \
-  --query 'Reservations[0].Instances[0].InstanceId' --output text)
-
-echo "  Registering app01 ($APP01_ID) in target group..."
-aws elbv2 register-targets \
-  --target-group-arn "$TG_ARN" \
-  --targets Id="$APP01_ID",Port=8080 \
-  --region "$AWS_REGION"
-
-# ---------- Subnets (at least 2 AZs for ALB) ----------
-SUBNET_IDS=$(aws ec2 describe-subnets \
-  --filters Name=vpc-id,Values="$VPC_ID" Name=defaultForAz,Values=true \
-  --region "$AWS_REGION" \
-  --query 'Subnets[*].SubnetId' --output text | tr '\t' ' ')
-
-# ---------- Create ALB ----------
-ALB_ARN=$(aws elbv2 describe-load-balancers \
-  --names selfapp-alb \
-  --region "$AWS_REGION" \
-  --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "None")
-
-if [ "$ALB_ARN" = "None" ] || [ -z "$ALB_ARN" ]; then
-  echo "  Creating ALB: selfapp-alb"
+# ---------- Load balancer ----------
+ALB_ARN=$(get_alb_arn)
+if [ -z "$ALB_ARN" ]; then
+  read -r -a SUBNETS <<<"$(get_default_subnets)"
+  [ ${#SUBNETS[@]} -ge 2 ] || die "An ALB needs subnets in at least 2 AZs; found ${#SUBNETS[@]}"
+  log "Creating ALB: $ALB_NAME (${#SUBNETS[@]} subnets)"
   ALB_ARN=$(aws elbv2 create-load-balancer \
-    --name selfapp-alb \
-    --subnets $SUBNET_IDS \
+    --name "$ALB_NAME" \
+    --type application --scheme internet-facing \
+    --subnets "${SUBNETS[@]}" \
     --security-groups "$ELB_SG" \
-    --region "$AWS_REGION" \
+    --tags "Key=Project,Value=$PROJECT_TAG" \
     --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+  log "Waiting for the ALB to become active (~2-3 min)..."
+  aws elbv2 wait load-balancer-available --load-balancer-arns "$ALB_ARN"
 else
-  echo "  ALB already exists: $ALB_ARN"
+  log "ALB exists: $ALB_NAME"
 fi
+# Security best practice: drop requests with malformed HTTP headers
+aws elbv2 modify-load-balancer-attributes --load-balancer-arn "$ALB_ARN" \
+  --attributes Key=routing.http.drop_invalid_header_fields.enabled,Value=true > /dev/null
 
-# ---------- Listeners ----------
+# ---------- Listeners (create or update, never "may already exist") ----------
+get_listener_arn() {  # $1 = port
+  aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" \
+    --query "Listeners[?Port==\`$1\`].ListenerArn | [0]" --output text | none_to_empty
+}
+
+# $1 = port, $2 = protocol, $3 = default action, remaining = extra CLI args
+ensure_listener() {
+  local port=$1 protocol=$2 action=$3 arn; shift 3
+  arn=$(get_listener_arn "$port")
+  if [ -n "$arn" ]; then
+    aws elbv2 modify-listener --listener-arn "$arn" \
+      --protocol "$protocol" --port "$port" --default-actions "$action" "$@" > /dev/null
+    log "Updated listener :$port ($protocol)"
+  else
+    aws elbv2 create-listener --load-balancer-arn "$ALB_ARN" \
+      --protocol "$protocol" --port "$port" --default-actions "$action" \
+      --tags "Key=Project,Value=$PROJECT_TAG" "$@" > /dev/null
+    log "Created listener :$port ($protocol)"
+  fi
+}
+
+FORWARD="Type=forward,TargetGroupArn=$TG_ARN"
+REDIRECT="Type=redirect,RedirectConfig={Protocol=HTTPS,Port=443,StatusCode=HTTP_301}"
+
 if [ -n "$CERT_ARN" ]; then
-  echo "  Adding HTTPS listener (443) with cert: $CERT_ARN"
-  aws elbv2 create-listener \
-    --load-balancer-arn "$ALB_ARN" \
-    --protocol HTTPS --port 443 \
-    --certificates CertificateArn="$CERT_ARN" \
-    --default-actions Type=forward,TargetGroupArn="$TG_ARN" \
-    --region "$AWS_REGION" 2>/dev/null || echo "  Listener may already exist"
-
-  echo "  Adding HTTP→HTTPS redirect listener (80)"
-  aws elbv2 create-listener \
-    --load-balancer-arn "$ALB_ARN" \
-    --protocol HTTP --port 80 \
-    --default-actions \
-      "Type=redirect,RedirectConfig={Protocol=HTTPS,Port=443,StatusCode=HTTP_301}" \
-    --region "$AWS_REGION" 2>/dev/null || echo "  Listener may already exist"
+  ensure_listener 443 HTTPS "$FORWARD" \
+    --certificates "CertificateArn=$CERT_ARN" --ssl-policy "$SSL_POLICY"
+  ensure_listener 80 HTTP "$REDIRECT"
 else
-  echo "  No CERT_ARN set — adding plain HTTP listener (port 80 → app :8080)"
-  aws elbv2 create-listener \
-    --load-balancer-arn "$ALB_ARN" \
-    --protocol HTTP --port 80 \
-    --default-actions Type=forward,TargetGroupArn="$TG_ARN" \
-    --region "$AWS_REGION" 2>/dev/null || echo "  Listener may already exist"
+  ensure_listener 80 HTTP "$FORWARD"
+  HTTPS_LISTENER=$(get_listener_arn 443)
+  if [ -n "$HTTPS_LISTENER" ]; then
+    aws elbv2 delete-listener --listener-arn "$HTTPS_LISTENER"
+    log "Removed :443 listener (CERT_ARN is empty)"
+  fi
 fi
 
-ALB_DNS=$(aws elbv2 describe-load-balancers \
-  --load-balancer-arns "$ALB_ARN" \
-  --region "$AWS_REGION" \
+ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns "$ALB_ARN" \
   --query 'LoadBalancers[0].DNSName' --output text)
 
 echo ""
-echo "==> Done."
-echo "    ALB DNS: $ALB_DNS"
+step "Done. ALB: http://$ALB_DNS"
 if [ -n "$DOMAIN_NAME" ]; then
-  echo "    Point a CNAME for $DOMAIN_NAME → $ALB_DNS in your DNS provider."
+  log "In your DNS provider, point a CNAME for $DOMAIN_NAME → $ALB_DNS"
 fi
-echo ""
-echo "    Run 07-asg.sh next, or validate now with 08-validate.sh."
+log "Targets take ~30-60s to pass health checks once the app is up."
+log "Next: 07-asg.sh"

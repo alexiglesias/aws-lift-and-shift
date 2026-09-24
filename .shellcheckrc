@@ -1,0 +1,7 @@
+# Shared shellcheck settings (used locally and in CI).
+# Follow `source` statements relative to each script's own directory.
+source-path=SCRIPTDIR
+external-sources=true
+# SC2016: AWS CLI --query strings are JMESPath, where backticks are literals,
+# e.g. 'Listeners[?Port==`80`]' — they are meant to stay unexpanded.
+disable=SC2016

@@ -1,113 +1,89 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 05-deploy-app.sh
-# 1. Builds the JAR locally (requires Java 17 + Maven)
-# 2. Creates the S3 bucket and uploads the JAR
-# 3. Launches app01 EC2 with the substituted userdata script
+# 1. Builds the selfapp-lite JAR locally (Java 17 + Maven)
+# 2. Uploads it to a private, encrypted S3 bucket
+# 3. Launches app01 — a single app server, the classic "rehost" step
+#
+# Once the ASG exists (07-asg.sh), app01 is no longer launched: re-run this
+# script to upload a new build, then roll it out with:
+#   bash scripts/07-asg.sh --refresh
 # =============================================================================
 set -euo pipefail
-source "$(dirname "$0")/../config.sh"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "$0")/lib.sh"
+init_account
 
-REPO_ROOT="$(dirname "$0")/../.."
-USERDATA_DIR="$(dirname "$0")/../userdata"
-
-echo "==> [05] Build JAR, upload to S3, launch app01"
-
-# ---------- Resolve bucket name ----------
-if [ -z "$BUCKET_NAME" ]; then
-  ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-  BUCKET_NAME="selfapp-artifacts-${ACCOUNT_ID}"
-fi
-echo "  S3 bucket: $BUCKET_NAME"
+step "[05] Build JAR, upload to S3, launch app01"
 
 # ---------- Build ----------
-echo "  Building selfapp-lite..."
-(cd "$REPO_ROOT/app" && mvn -B clean package -DskipTests -q)
-JAR=$(ls "$REPO_ROOT/app/target/selfapp-lite-"*.jar | head -1)
-echo "  JAR: $JAR"
+command -v mvn >/dev/null || die "Maven not found. Install Maven and Java 17 first."
+APP_DIR=$(cd "$ROOT_DIR" && cd "$APP_SRC_DIR" 2>/dev/null && pwd) \
+  || die "APP_SRC_DIR='$APP_SRC_DIR' not found (relative to $ROOT_DIR)"
+[ -f "$APP_DIR/pom.xml" ] || die "No pom.xml in $APP_DIR — point APP_SRC_DIR at the Maven project folder"
+
+log "Building $APP_DIR ..."
+mvn -B -q -f "$APP_DIR/pom.xml" clean package -DskipTests
+JAR=$(find "$APP_DIR/target" -maxdepth 1 -name 'selfapp-lite-*.jar' ! -name '*-plain.jar' | head -1)
+[ -n "$JAR" ] || die "Build finished but no selfapp-lite-*.jar found in $APP_DIR/target"
+log "Built: $(basename "$JAR")"
 
 # ---------- S3 bucket ----------
-if ! aws s3 ls "s3://$BUCKET_NAME" --region "$AWS_REGION" &>/dev/null; then
-  echo "  Creating S3 bucket: $BUCKET_NAME"
+if HEAD_ERR=$(aws s3api head-bucket --bucket "$BUCKET_NAME" 2>&1); then
+  log "Bucket s3://$BUCKET_NAME already exists"
+elif grep -q '404\|Not Found' <<<"$HEAD_ERR"; then
+  log "Creating bucket s3://$BUCKET_NAME"
   if [ "$AWS_REGION" = "us-east-1" ]; then
-    aws s3 mb "s3://$BUCKET_NAME" --region "$AWS_REGION"
+    aws s3api create-bucket --bucket "$BUCKET_NAME" > /dev/null
   else
-    aws s3api create-bucket \
-      --bucket "$BUCKET_NAME" \
-      --region "$AWS_REGION" \
-      --create-bucket-configuration LocationConstraint="$AWS_REGION"
+    aws s3api create-bucket --bucket "$BUCKET_NAME" \
+      --create-bucket-configuration LocationConstraint="$AWS_REGION" > /dev/null
   fi
-fi
-
-echo "  Uploading JAR to S3..."
-aws s3 cp "$JAR" "s3://${BUCKET_NAME}/selfapp-lite-1.0.0.jar"
-
-# ---------- Prepare userdata ----------
-APP01_SCRIPT=$(mktemp)
-sed \
-  -e "s/__BUCKET_NAME__/${BUCKET_NAME}/g" \
-  -e "s/__PRIVATE_ZONE__/${PRIVATE_ZONE}/g" \
-  -e "s/__DB_NAME__/${DB_NAME}/g" \
-  -e "s/__DB_USER__/${DB_USER}/g" \
-  -e "s/__DB_PASS__/${DB_PASS}/g" \
-  "$USERDATA_DIR/app01.sh" > "$APP01_SCRIPT"
-
-# ---------- Launch app01 ----------
-VPC_ID=$(aws ec2 describe-vpcs \
-  --filters Name=isDefault,Values=true \
-  --region "$AWS_REGION" \
-  --query 'Vpcs[0].VpcId' --output text)
-
-APP_SG=$(aws ec2 describe-security-groups \
-  --filters Name=group-name,Values=selfapp-app-sg Name=vpc-id,Values="$VPC_ID" \
-  --region "$AWS_REGION" \
-  --query 'SecurityGroups[0].GroupId' --output text)
-
-PROFILE_ARN=$(aws iam get-instance-profile \
-  --instance-profile-name selfapp-ec2-profile \
-  --query 'InstanceProfile.Arn' --output text)
-
-EXISTING=$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=app01" Name=instance-state-name,Values=running,pending \
-  --region "$AWS_REGION" \
-  --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "None")
-
-if [ "$EXISTING" != "None" ] && [ -n "$EXISTING" ]; then
-  echo "  app01 already running ($EXISTING) — skipping launch"
+  aws s3api put-public-access-block --bucket "$BUCKET_NAME" \
+    --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  aws s3api put-bucket-tagging --bucket "$BUCKET_NAME" \
+    --tagging "TagSet=[{Key=Project,Value=$PROJECT_TAG}]"
 else
-  echo "  Launching app01..."
-  INSTANCE_ID=$(aws ec2 run-instances \
-    --image-id "$AMI_ID" \
-    --instance-type t2.micro \
-    --key-name "$KEY_NAME" \
-    --security-group-ids "$APP_SG" \
-    --iam-instance-profile Arn="$PROFILE_ARN" \
-    --user-data file://"$APP01_SCRIPT" \
-    --region "$AWS_REGION" \
-    --tag-specifications \
-      "ResourceType=instance,Tags=[{Key=Name,Value=app01},{Key=Project,Value=selfapp-lift-shift}]" \
-    --query 'Instances[0].InstanceId' --output text)
-  echo "  Instance ID: $INSTANCE_ID"
+  die "Can't use bucket '$BUCKET_NAME' (owned by another account?): $HEAD_ERR"
 fi
 
-rm -f "$APP01_SCRIPT"
+log "Uploading JAR → s3://$BUCKET_NAME/$JAR_KEY"
+aws s3 cp "$JAR" "s3://$BUCKET_NAME/$JAR_KEY" --only-show-errors
 
-echo ""
-echo "==> app01 launched. Waiting for it to reach 'running'..."
-aws ec2 wait instance-running \
-  --filters "Name=tag:Name,Values=app01" \
-  --region "$AWS_REGION"
+# ---------- app01 ----------
+if asg_exists; then
+  echo ""
+  step "Done. The ASG manages the app tier now, so app01 was not launched."
+  log "Roll out the new JAR with: bash scripts/07-asg.sh --refresh"
+  exit 0
+fi
 
-APP01_IP=$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=app01" Name=instance-state-name,Values=running \
-  --region "$AWS_REGION" \
+APP_SG=$(get_sg_id "$APP_SG_NAME")
+[ -n "$APP_SG" ] || die "Security group '$APP_SG_NAME' not found — run 01-security-groups.sh first"
+
+INSTANCE_ID=$(get_instance_id app01)
+if [ -n "$INSTANCE_ID" ]; then
+  log "app01 already exists ($INSTANCE_ID) — skipping launch"
+  log "(The new JAR is only picked up at boot; to redeploy, terminate app01 and re-run.)"
+else
+  USERDATA=$(mktemp)
+  trap 'rm -f "$USERDATA"' EXIT
+  render_template "$ROOT_DIR/userdata/app01.sh" > "$USERDATA"
+  INSTANCE_ID=$(launch_instance app01 "$APP_SG" "$USERDATA")
+  log "Launched app01: $INSTANCE_ID"
+fi
+
+log "Waiting for app01 to reach 'running'..."
+aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+
+PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 
 echo ""
-echo "==> app01 is up: $APP01_IP"
-echo "    The Spring Boot app takes ~60s to start after the instance is running."
-echo "    Check: ssh -i ~/.ssh/${KEY_NAME}.pem ec2-user@${APP01_IP}"
-echo "           sudo journalctl -u selfapp -f"
-echo "           curl localhost:8080/actuator/health"
-echo ""
-echo "    Run 06-alb.sh next."
+step "app01 is running: $PUBLIC_IP"
+log "Java install + Spring Boot startup take ~2-4 min. To watch it:"
+log "  ssh -i ~/.ssh/${KEY_NAME}.pem ec2-user@${PUBLIC_IP}"
+log "  sudo tail -f /var/log/userdata-app01.log   # bootstrap"
+log "  sudo journalctl -u selfapp -f               # application"
+log "  curl -s localhost:8080/actuator/health"
+log "Next: 06-alb.sh"

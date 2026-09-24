@@ -1,0 +1,40 @@
+# CI: lint every shell script and run the offline tests.
+# No AWS credentials are used — nothing here touches a real account.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Lint scripts (settings in .shellcheckrc)
+        run: |
+          shellcheck --version
+          shellcheck scripts/*.sh userdata/*.sh tests/*.sh
+
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS runs the tests with /bin/bash — the stock Bash 3.2 that
+        # ships with every Mac — to prove the scripts stay portable.
+        include:
+          - os: ubuntu-latest
+            shell_bin: bash
+          - os: macos-latest
+            shell_bin: /bin/bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run tests/test.sh
+        run: ${{ matrix.shell_bin }} tests/test.sh

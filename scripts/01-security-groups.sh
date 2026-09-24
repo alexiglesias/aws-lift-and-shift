@@ -1,92 +1,79 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 01-security-groups.sh
-# Creates: Key Pair + 3 Security Groups (ELB, app, backend)
+# Creates: SSH key pair + 3 security groups, chained so each tier only
+# accepts traffic from the tier in front of it:
+#
+#   Internet --80/443--> elb-sg --8080--> app-sg --3306/5672--> backend-sg
+#
+# SSH (22) is allowed only from YOUR_IP.
 # =============================================================================
 set -euo pipefail
-source "$(dirname "$0")/../config.sh"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "$0")/lib.sh"
 
-echo "==> [01] Creating Key Pair and Security Groups"
+step "[01] Key pair and security groups"
 
-# ---------- Key Pair ----------
-if ! aws ec2 describe-key-pairs --key-names "$KEY_NAME" --region "$AWS_REGION" &>/dev/null; then
-  echo "  Creating key pair: $KEY_NAME"
+# ---------- Key pair ----------
+PEM_FILE="$HOME/.ssh/${KEY_NAME}.pem"
+if aws ec2 describe-key-pairs --key-names "$KEY_NAME" &>/dev/null; then
+  log "Key pair '$KEY_NAME' already exists — skipping"
+  [ -f "$PEM_FILE" ] || warn "$PEM_FILE is missing; you won't be able to SSH. Delete the key pair in AWS and re-run to recreate it."
+else
+  # An empty file is debris from an earlier failed run — safe to remove.
+  [ -s "$PEM_FILE" ] || rm -f "$PEM_FILE"
+  [ ! -e "$PEM_FILE" ] || die "$PEM_FILE already exists but the key pair is not in AWS. Move the file away and re-run."
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  log "Creating key pair: $KEY_NAME"
+  # Write to a temp file and move it into place only on success: a plain
+  # "> $PEM_FILE" redirect would leave an empty key file if the call failed.
+  PEM_TMP=$(mktemp "$HOME/.ssh/.${KEY_NAME}.XXXXXX")
+  trap 'rm -f "$PEM_TMP"' EXIT
   aws ec2 create-key-pair \
     --key-name "$KEY_NAME" \
-    --region "$AWS_REGION" \
-    --query 'KeyMaterial' \
-    --output text > ~/.ssh/"${KEY_NAME}".pem
-  chmod 400 ~/.ssh/"${KEY_NAME}".pem
-  echo "  Key saved to ~/.ssh/${KEY_NAME}.pem"
-else
-  echo "  Key pair '$KEY_NAME' already exists — skipping"
+    --tag-specifications "ResourceType=key-pair,Tags=[{Key=Project,Value=$PROJECT_TAG}]" \
+    --query 'KeyMaterial' --output text > "$PEM_TMP"
+  chmod 400 "$PEM_TMP"
+  mv "$PEM_TMP" "$PEM_FILE"
+  log "Private key saved to $PEM_FILE"
 fi
 
-# ---------- Get default VPC ----------
-VPC_ID=$(aws ec2 describe-vpcs \
-  --filters Name=isDefault,Values=true \
-  --region "$AWS_REGION" \
-  --query 'Vpcs[0].VpcId' --output text)
-echo "  VPC: $VPC_ID"
+# ---------- Security groups ----------
+VPC_ID=$(get_vpc_id)
+[ -n "$VPC_ID" ] || die "No default VPC in $AWS_REGION. Create one with: aws ec2 create-default-vpc"
+log "Default VPC: $VPC_ID"
 
-# Helper: create SG or return existing ID
-create_sg() {
-  local NAME=$1 DESC=$2
-  local EXISTING
-  EXISTING=$(aws ec2 describe-security-groups \
-    --filters Name=group-name,Values="$NAME" Name=vpc-id,Values="$VPC_ID" \
-    --region "$AWS_REGION" \
-    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
-  if [ "$EXISTING" != "None" ] && [ -n "$EXISTING" ]; then
-    echo "$EXISTING"
-  else
-    aws ec2 create-security-group \
-      --group-name "$NAME" \
-      --description "$DESC" \
-      --vpc-id "$VPC_ID" \
-      --region "$AWS_REGION" \
-      --query 'GroupId' --output text
+ensure_sg() {  # $1 = name, $2 = description → prints the group ID
+  local id
+  id=$(get_sg_id "$1")
+  if [ -z "$id" ]; then
+    id=$(aws ec2 create-security-group \
+      --group-name "$1" --description "$2" --vpc-id "$VPC_ID" \
+      --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$1},{Key=Project,Value=$PROJECT_TAG}]" \
+      --query 'GroupId' --output text)
   fi
+  echo "$id"
 }
 
-# ---------- selfapp-ELB-sg ----------
-echo "  Creating selfapp-ELB-sg..."
-ELB_SG=$(create_sg "selfapp-ELB-sg" "ALB public traffic")
-aws ec2 authorize-security-group-ingress --group-id "$ELB_SG" \
-  --protocol tcp --port 80 --cidr 0.0.0.0/0 --region "$AWS_REGION" 2>/dev/null || true
-aws ec2 authorize-security-group-ingress --group-id "$ELB_SG" \
-  --protocol tcp --port 443 --cidr 0.0.0.0/0 --region "$AWS_REGION" 2>/dev/null || true
+ELB_SG=$(ensure_sg "$ELB_SG_NAME" "selfapp ALB - public HTTP/HTTPS")
+log "$ELB_SG_NAME: $ELB_SG"
+authorize_ingress "$ELB_SG" --protocol tcp --port 80  --cidr 0.0.0.0/0
+authorize_ingress "$ELB_SG" --protocol tcp --port 443 --cidr 0.0.0.0/0
 
-# ---------- selfapp-app-sg ----------
-echo "  Creating selfapp-app-sg..."
-APP_SG=$(create_sg "selfapp-app-sg" "App EC2 - Spring Boot :8080")
-aws ec2 authorize-security-group-ingress --group-id "$APP_SG" \
-  --protocol tcp --port 8080 --source-group "$ELB_SG" --region "$AWS_REGION" 2>/dev/null || true
-if [ "$YOUR_IP" != "0.0.0.0" ]; then
-  aws ec2 authorize-security-group-ingress --group-id "$APP_SG" \
-    --protocol tcp --port 22 --cidr "${YOUR_IP}/32" --region "$AWS_REGION" 2>/dev/null || true
-fi
+APP_SG=$(ensure_sg "$APP_SG_NAME" "selfapp app tier - Spring Boot 8080 from ALB")
+log "$APP_SG_NAME: $APP_SG"
+authorize_ingress "$APP_SG" --protocol tcp --port 8080 --source-group "$ELB_SG"
+authorize_ingress "$APP_SG" --protocol tcp --port 22   --cidr "${YOUR_IP}/32"
 
-# ---------- selfapp-backend-sg ----------
-echo "  Creating selfapp-backend-sg..."
-BACKEND_SG=$(create_sg "selfapp-backend-sg" "Backend services - MySQL, Memcached, RabbitMQ")
-# Allow app EC2 → backend ports
-for PORT in 3306 11211 5672 15672; do
-  aws ec2 authorize-security-group-ingress --group-id "$BACKEND_SG" \
-    --protocol tcp --port "$PORT" --source-group "$APP_SG" --region "$AWS_REGION" 2>/dev/null || true
+BACKEND_SG=$(ensure_sg "$BACKEND_SG_NAME" "selfapp backends - MySQL and RabbitMQ from app tier")
+log "$BACKEND_SG_NAME: $BACKEND_SG"
+for PORT in 3306 5672; do   # MySQL, AMQP (RabbitMQ)
+  authorize_ingress "$BACKEND_SG" --protocol tcp --port "$PORT" --source-group "$APP_SG"
 done
-# Allow backend instances to reach each other
-aws ec2 authorize-security-group-ingress --group-id "$BACKEND_SG" \
-  --protocol all --source-group "$BACKEND_SG" --region "$AWS_REGION" 2>/dev/null || true
-if [ "$YOUR_IP" != "0.0.0.0" ]; then
-  aws ec2 authorize-security-group-ingress --group-id "$BACKEND_SG" \
-    --protocol tcp --port 22 --cidr "${YOUR_IP}/32" --region "$AWS_REGION" 2>/dev/null || true
-fi
+authorize_ingress "$BACKEND_SG" --protocol tcp --port 22 --cidr "${YOUR_IP}/32"
+# RabbitMQ management UI (15672) is intentionally NOT opened.
+# Reach it through an SSH tunnel:
+#   ssh -i ~/.ssh/selfapp-key.pem -L 15672:localhost:15672 ec2-user@<rmq01-public-ip>
 
 echo ""
-echo "==> Done. Security Group IDs:"
-echo "    ELB_SG:     $ELB_SG"
-echo "    APP_SG:     $APP_SG"
-echo "    BACKEND_SG: $BACKEND_SG"
-echo ""
-echo "    These are auto-discovered by subsequent scripts."
+step "Done. Security groups are looked up by name in later scripts."

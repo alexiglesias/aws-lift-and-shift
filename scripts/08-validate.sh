@@ -1,133 +1,182 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 08-validate.sh
-# Runs a checklist to confirm the stack is healthy end-to-end.
+# End-to-end checklist for the deployment. Exits 0 only if every check
+# passes, so it can gate a CI pipeline or a teardown/redeploy script.
+#
+#   ✅ pass   ❌ fail (counts toward the exit code)   ⚠️  warning (informational)
+#
+# Usage:
+#   bash scripts/08-validate.sh          # check once
+#   bash scripts/08-validate.sh --wait   # first wait up to 10 min for healthy
+#                                        # targets (handy right after deploying)
 # =============================================================================
-set -euo pipefail
-source "$(dirname "$0")/../config.sh"
+# No "set -e": every check must run even when an earlier one fails.
+set -uo pipefail
+# shellcheck source=scripts/lib.sh
+source "$(dirname "$0")/lib.sh"
 
-PASS="✅"
-FAIL="❌"
-WARN="⚠️ "
+WAIT=false
+case "${1:-}" in
+  --wait) WAIT=true ;;
+  "") ;;
+  *) die "Unknown option '$1'. Usage: $0 [--wait]" ;;
+esac
 
-echo "==> [08] Validating selfapp Lift & Shift deployment"
-echo ""
+FAILS=0 WARNS=0
+pass()  { echo "  ✅ $*"; }
+fail()  { echo "  ❌ $*"; FAILS=$((FAILS + 1)); }
+warnc() { echo "  ⚠️  $*"; WARNS=$((WARNS + 1)); }
+section() { echo ""; echo "--- $* ---"; }
 
-ERRORS=0
+step "[08] Validating the selfapp deployment in $AWS_REGION"
 
-check() {
-  local LABEL=$1 CMD=$2
-  if eval "$CMD" &>/dev/null; then
-    echo "  $PASS $LABEL"
+# ---------- Instances ----------
+section "EC2 instances"
+for NAME in db01 rmq01; do
+  ID=$(get_instance_id "$NAME")
+  if [ -n "$ID" ]; then pass "$NAME is running ($ID)"; else fail "$NAME is not running"; fi
+done
+
+if asg_exists; then
+  read -r DESIRED IN_SERVICE <<<"$(aws autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG_NAME" \
+    --query 'AutoScalingGroups[0].[DesiredCapacity, length(Instances[?LifecycleState==`InService`])]' \
+    --output text)"
+  if [ "$IN_SERVICE" -ge 1 ]; then
+    pass "$ASG_NAME: $IN_SERVICE/$DESIRED instance(s) InService"
   else
-    echo "  $FAIL $LABEL"
-    ERRORS=$((ERRORS + 1))
+    fail "$ASG_NAME: 0/$DESIRED instances InService"
   fi
-}
-
-# ---------- EC2 instances running ----------
-echo "--- EC2 Instances ---"
-for NAME in db01 mc01 rmq01 app01; do
-  STATE=$(aws ec2 describe-instances \
-    --filters "Name=tag:Name,Values=$NAME" Name=instance-state-name,Values=running \
-    --region "$AWS_REGION" \
-    --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "none")
-  if [ "$STATE" = "running" ]; then
-    echo "  $PASS $NAME is running"
+  [ -z "$(get_instance_id app01)" ] || warnc "app01 is still running alongside the ASG — terminate it to save Free Tier hours"
+else
+  if [ -n "$(get_instance_id app01)" ]; then
+    pass "app01 is running (no ASG yet — run 07-asg.sh)"
   else
-    echo "  $FAIL $NAME is NOT running (state: $STATE)"
-    ERRORS=$((ERRORS + 1))
+    fail "No app tier: neither $ASG_NAME nor app01 exists"
+  fi
+fi
+
+# ---------- Private DNS (also detects drift: record IP ≠ instance IP) ----------
+section "Route 53 private zone"
+ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$PRIVATE_ZONE" \
+  --query "HostedZones[?Name=='${PRIVATE_ZONE}.' && Config.PrivateZone] | [0].Id" \
+  --output text | none_to_empty)
+ZONE_ID=${ZONE_ID##*/}
+if [ -z "$ZONE_ID" ]; then
+  fail "Private zone $PRIVATE_ZONE not found"
+else
+  pass "Private zone $PRIVATE_ZONE exists ($ZONE_ID)"
+  for HOST in db01 rmq01; do
+    RECORD_IP=$(aws route53 list-resource-record-sets --hosted-zone-id "$ZONE_ID" \
+      --query "ResourceRecordSets[?Name=='${HOST}.${PRIVATE_ZONE}.' && Type=='A'].ResourceRecords[0].Value | [0]" \
+      --output text | none_to_empty)
+    ACTUAL_IP=$(get_private_ip "$HOST")
+    if [ -z "$RECORD_IP" ]; then
+      fail "${HOST}.${PRIVATE_ZONE} has no A record"
+    elif [ "$RECORD_IP" != "$ACTUAL_IP" ]; then
+      fail "${HOST}.${PRIVATE_ZONE} → $RECORD_IP but $HOST is at ${ACTUAL_IP:-<not running>} (re-run 04-route53.sh)"
+    else
+      pass "${HOST}.${PRIVATE_ZONE} → $RECORD_IP"
+    fi
+  done
+fi
+
+# ---------- Security groups: nothing but the ALB open to the world ----------
+section "Security groups"
+for SG_NAME in "$APP_SG_NAME" "$BACKEND_SG_NAME"; do
+  SG_ID=$(get_sg_id "$SG_NAME")
+  if [ -z "$SG_ID" ]; then fail "$SG_NAME not found"; continue; fi
+  OPEN=$(aws ec2 describe-security-groups --group-ids "$SG_ID" \
+    --query "SecurityGroups[0].IpPermissions[?IpRanges[?CidrIp=='0.0.0.0/0']] | length(@)" --output text)
+  if [ "$OPEN" = "0" ]; then
+    pass "$SG_NAME has no rules open to 0.0.0.0/0"
+  else
+    fail "$SG_NAME has $OPEN rule(s) open to 0.0.0.0/0"
   fi
 done
 
-echo ""
-echo "--- ALB & Target Group ---"
-
-ALB_DNS=$(aws elbv2 describe-load-balancers \
-  --names selfapp-alb \
-  --region "$AWS_REGION" \
-  --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || echo "")
-
-if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" = "None" ]; then
-  echo "  $FAIL selfapp-alb not found"
-  ERRORS=$((ERRORS + 1))
+# ---------- Load balancer + target health ----------
+section "Load balancer"
+ALB_ARN=$(get_alb_arn)
+TG_ARN=$(get_tg_arn)
+ALB_DNS=""
+if [ -z "$ALB_ARN" ]; then
+  fail "$ALB_NAME not found"
 else
-  echo "  $PASS selfapp-alb exists: $ALB_DNS"
+  read -r ALB_STATE ALB_DNS <<<"$(aws elbv2 describe-load-balancers --load-balancer-arns "$ALB_ARN" \
+    --query 'LoadBalancers[0].[State.Code, DNSName]' --output text)"
+  if [ "$ALB_STATE" = "active" ]; then pass "$ALB_NAME is active: $ALB_DNS"; else fail "$ALB_NAME state: $ALB_STATE"; fi
 fi
 
-TG_ARN=$(aws elbv2 describe-target-groups \
-  --names selfapp-tg \
-  --region "$AWS_REGION" \
-  --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
+healthy_count() {
+  aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
+    --query 'length(TargetHealthDescriptions[?TargetHealth.State==`healthy`])' --output text
+}
 
-if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
-  HEALTHY=$(aws elbv2 describe-target-health \
-    --target-group-arn "$TG_ARN" \
-    --region "$AWS_REGION" \
-    --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`] | length(@)' --output text)
-  if [ "$HEALTHY" -gt 0 ]; then
-    echo "  $PASS Target group: $HEALTHY healthy target(s)"
+if [ -z "$TG_ARN" ]; then
+  fail "$TG_NAME not found"
+else
+  if [ "$WAIT" = true ]; then
+    log "Waiting up to 10 min for a healthy target..."
+    for _ in $(seq 1 40); do
+      [ "$(healthy_count)" -ge 1 ] && break
+      sleep 15
+    done
+  fi
+  HEALTHY=$(healthy_count)
+  if [ "$HEALTHY" -ge 1 ]; then
+    pass "$TG_NAME: $HEALTHY healthy target(s)"
   else
-    echo "  $WARN Target group: 0 healthy targets (app may still be starting)"
-    echo "       Check: aws elbv2 describe-target-health --target-group-arn $TG_ARN --region $AWS_REGION"
+    fail "$TG_NAME: no healthy targets. Details:"
+    aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
+      --query 'TargetHealthDescriptions[].[Target.Id, TargetHealth.State, TargetHealth.Description]' \
+      --output text | while read -r LINE; do echo "       $LINE"; done
   fi
 fi
 
-echo ""
-echo "--- App Health Check ---"
+# ---------- The app, through the public entrypoint ----------
+section "Application (through the ALB)"
+http_code() {  # $1 = URL; prints the status code, "000" if unreachable
+  curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$1" || true
+}
 
-if [ -n "$ALB_DNS" ] && [ "$ALB_DNS" != "None" ]; then
-  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${ALB_DNS}/actuator/health" || echo "000")
-  if [ "$HTTP_STATUS" = "200" ]; then
-    echo "  $PASS /actuator/health → HTTP $HTTP_STATUS"
+if [ -z "$ALB_DNS" ]; then
+  fail "Skipped: no ALB DNS name"
+else
+  if [ -n "$CERT_ARN" ] && [ -n "$DOMAIN_NAME" ]; then
+    BASE_URL="https://$DOMAIN_NAME"
+    CODE=$(http_code "http://$ALB_DNS/login")
+    if [ "$CODE" = "301" ]; then pass "HTTP → HTTPS redirect (301)"; else fail "HTTP returned $CODE, expected 301 redirect"; fi
   else
-    echo "  $WARN /actuator/health → HTTP $HTTP_STATUS (may still be starting, retry in ~60s)"
+    BASE_URL="http://$ALB_DNS"
+    [ -z "$CERT_ARN" ] && warnc "Serving plain HTTP (no CERT_ARN set)"
   fi
 
-  HTTP_LOGIN=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${ALB_DNS}/login" || echo "000")
-  if [ "$HTTP_LOGIN" = "200" ]; then
-    echo "  $PASS /login → HTTP $HTTP_LOGIN"
+  HEALTH_BODY=$(curl -s --max-time 10 "$BASE_URL/actuator/health" || true)
+  if grep -q '"status":"UP"' <<<"$HEALTH_BODY"; then
+    pass "$BASE_URL/actuator/health → UP (MySQL + RabbitMQ reachable)"
   else
-    echo "  $WARN /login → HTTP $HTTP_LOGIN"
+    fail "$BASE_URL/actuator/health → ${HEALTH_BODY:-no response}"
   fi
+
+  CODE=$(http_code "$BASE_URL/login")
+  if [ "$CODE" = "200" ]; then pass "$BASE_URL/login → 200"; else fail "$BASE_URL/login → $CODE"; fi
 fi
 
-echo ""
-echo "--- Route 53 ---"
-ZONE_ID=$(aws route53 list-hosted-zones-by-name \
-  --dns-name "$PRIVATE_ZONE" \
-  --query "HostedZones[?Name=='${PRIVATE_ZONE}.'].Id" \
-  --output text 2>/dev/null | cut -d/ -f3)
+# ---------- Cost awareness ----------
+section "Cost"
+RUNNING=$(aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=$PROJECT_TAG" Name=instance-state-name,Values=running \
+  --query 'length(Reservations[].Instances[])' --output text)
+warnc "$RUNNING instance(s) running ≈ $((RUNNING * 24)) instance-hours/day. Run 99-teardown.sh when you're done."
 
-if [ -n "$ZONE_ID" ]; then
-  RECORD_COUNT=$(aws route53 list-resource-record-sets \
-    --hosted-zone-id "$ZONE_ID" \
-    --query 'ResourceRecordSets[?Type==`A`] | length(@)' --output text)
-  echo "  $PASS Hosted zone $PRIVATE_ZONE exists ($RECORD_COUNT A records)"
-else
-  echo "  $FAIL Hosted zone $PRIVATE_ZONE not found"
-  ERRORS=$((ERRORS + 1))
-fi
-
+# ---------- Result ----------
 echo ""
-echo "--- ASG ---"
-ASG_DESIRED=$(aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names selfapp-asg \
-  --region "$AWS_REGION" \
-  --query 'AutoScalingGroups[0].DesiredCapacity' --output text 2>/dev/null || echo "0")
-if [ "$ASG_DESIRED" -gt 0 ]; then
-  echo "  $PASS selfapp-asg desired capacity: $ASG_DESIRED"
+if [ "$FAILS" -eq 0 ]; then
+  step "All checks passed ($WARNS warning(s)). Open: ${BASE_URL:-http://$ALB_DNS}/login"
+  exit 0
 else
-  echo "  $WARN selfapp-asg not found or has 0 desired capacity"
-fi
-
-echo ""
-if [ "$ERRORS" -eq 0 ]; then
-  echo "==> All checks passed!"
-  echo ""
-  echo "    Access the app:"
-  [ -n "$ALB_DNS" ] && echo "    http://${ALB_DNS}/login"
-  [ -n "$DOMAIN_NAME" ] && echo "    https://${DOMAIN_NAME}/login"
-else
-  echo "==> $ERRORS check(s) failed. Review output above."
+  step "$FAILS check(s) failed, $WARNS warning(s). See ❌ above."
+  exit 1
 fi

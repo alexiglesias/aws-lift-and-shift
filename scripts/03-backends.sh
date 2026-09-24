@@ -1,83 +1,51 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 03-backends.sh
-# Launches db01 (MySQL), mc01 (Memcached), rmq01 (RabbitMQ) EC2 instances.
-# Substitutes credentials into userdata scripts before sending to EC2.
+# Launches the backend tier — one EC2 instance per service, mirroring the
+# docker-compose stack:
+#   db01  → MySQL 8.4    (userdata/db01.sh)
+#   rmq01 → RabbitMQ 3.13 (userdata/rmq01.sh)
+# Both get the instance profile so they can read their passwords from SSM.
+# Safe to re-run: instances that are already pending/running are skipped.
 # =============================================================================
 set -euo pipefail
-source "$(dirname "$0")/../config.sh"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "$0")/lib.sh"
+init_account
 
-USERDATA_DIR="$(dirname "$0")/../userdata"
+step "[03] Launching backend instances"
 
-echo "==> [03] Launching backend EC2 instances"
+BACKEND_SG=$(get_sg_id "$BACKEND_SG_NAME")
+[ -n "$BACKEND_SG" ] || die "Security group '$BACKEND_SG_NAME' not found — run 01-security-groups.sh first"
 
-VPC_ID=$(aws ec2 describe-vpcs \
-  --filters Name=isDefault,Values=true \
-  --region "$AWS_REGION" \
-  --query 'Vpcs[0].VpcId' --output text)
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
 
-BACKEND_SG=$(aws ec2 describe-security-groups \
-  --filters Name=group-name,Values=selfapp-backend-sg Name=vpc-id,Values="$VPC_ID" \
-  --region "$AWS_REGION" \
-  --query 'SecurityGroups[0].GroupId' --output text)
-
-# Helper: launch or skip if instance already running
-launch_instance() {
-  local NAME=$1 USERDATA_FILE=$2
-
-  EXISTING=$(aws ec2 describe-instances \
-    --filters "Name=tag:Name,Values=$NAME" Name=instance-state-name,Values=running,pending \
-    --region "$AWS_REGION" \
-    --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "None")
-
-  if [ "$EXISTING" != "None" ] && [ -n "$EXISTING" ]; then
-    echo "  $NAME already running ($EXISTING) — skipping"
-    return
+INSTANCE_IDS=()
+for NAME in db01 rmq01; do
+  ID=$(get_instance_id "$NAME")
+  if [ -n "$ID" ]; then
+    log "$NAME already exists ($ID) — skipping"
+  else
+    render_template "$ROOT_DIR/userdata/$NAME.sh" > "$TMP_DIR/$NAME.sh"
+    ID=$(launch_instance "$NAME" "$BACKEND_SG" "$TMP_DIR/$NAME.sh")
+    log "Launched $NAME: $ID"
   fi
-
-  echo "  Launching $NAME..."
-  aws ec2 run-instances \
-    --image-id "$AMI_ID" \
-    --instance-type t2.micro \
-    --key-name "$KEY_NAME" \
-    --security-group-ids "$BACKEND_SG" \
-    --user-data file://"$USERDATA_FILE" \
-    --region "$AWS_REGION" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Project,Value=selfapp-lift-shift}]" \
-    --query 'Instances[0].InstanceId' --output text
-}
-
-# Substitute credentials into db01 userdata
-DB01_SCRIPT=$(mktemp)
-sed \
-  -e "s/__DB_ROOT_PASS__/${DB_ROOT_PASS}/g" \
-  -e "s/__DB_NAME__/${DB_NAME}/g" \
-  -e "s/__DB_USER__/${DB_USER}/g" \
-  -e "s/__DB_PASS__/${DB_PASS}/g" \
-  "$USERDATA_DIR/db01.sh" > "$DB01_SCRIPT"
-
-launch_instance "db01"  "$DB01_SCRIPT"
-launch_instance "mc01"  "$USERDATA_DIR/mc01.sh"
-launch_instance "rmq01" "$USERDATA_DIR/rmq01.sh"
-
-rm -f "$DB01_SCRIPT"
-
-echo ""
-echo "==> Backend instances launched. Waiting for them to reach 'running' state..."
-aws ec2 wait instance-running \
-  --filters "Name=tag:Project,Values=selfapp-lift-shift" \
-            "Name=tag:Name,Values=db01" \
-  --region "$AWS_REGION"
-
-echo ""
-echo "==> Instance private IPs:"
-for NAME in db01 mc01 rmq01; do
-  IP=$(aws ec2 describe-instances \
-    --filters "Name=tag:Name,Values=$NAME" Name=instance-state-name,Values=running \
-    --region "$AWS_REGION" \
-    --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
-  echo "    $NAME → $IP"
+  INSTANCE_IDS+=("$ID")
 done
 
+# Wait on these exact IDs — filtering by tag would also match terminated
+# instances from earlier runs and make the waiter fail.
+log "Waiting for ${INSTANCE_IDS[*]} to reach 'running'..."
+aws ec2 wait instance-running --instance-ids "${INSTANCE_IDS[@]}"
+
 echo ""
-echo "    Run 04-route53.sh next to register these IPs in DNS."
+step "Backends running:"
+aws ec2 describe-instances --instance-ids "${INSTANCE_IDS[@]}" \
+  --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value, InstanceId, PrivateIpAddress]' \
+  --output text | while read -r N I IP; do log "$N  $I  $IP"; done
+
+echo ""
+log "'running' means booted, not ready: MySQL and RabbitMQ take ~3-5 min to install."
+log "Follow progress with: ssh -i ~/.ssh/${KEY_NAME}.pem ec2-user@<public-ip> sudo tail -f /var/log/userdata-db01.log"
+log "Next: 04-route53.sh"
