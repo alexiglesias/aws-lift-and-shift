@@ -165,7 +165,7 @@ done
 
 # ---------- 9. Key pair ----------
 if aws ec2 describe-key-pairs --key-names "$KEY_NAME" &>/dev/null; then
-  aws ec2 delete-key-pair --key-name "$KEY_NAME"
+  aws ec2 delete-key-pair --key-name "$KEY_NAME" > /dev/null
   log "Deleted key pair $KEY_NAME"
 fi
 if [ -f "$HOME/.ssh/${KEY_NAME}.pem" ]; then
