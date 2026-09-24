@@ -74,6 +74,8 @@ projects/
 
 ## Quick start
 
+For a detailed walkthrough with expected output at every step, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 **1. Configure.** Every script validates the config on startup and stops with a clear message if something is missing.
 
 ```bash
